@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -116,15 +115,15 @@ func (p *PingProc) sendEcho(cn *icmp.PacketConn) error {
 }
 
 type recvResult struct {
-	bytes []byte
-	err   error
+	msg *icmp.Message
+	err error
 }
 
 func (p *PingProc) recvEchoReply(cn *icmp.PacketConn, ch chan recvResult) {
 	for {
 		bytes := make([]byte, 512)
 
-		_, peer, err := cn.ReadFrom(bytes)
+		_, _, err := cn.ReadFrom(bytes)
 		if err != nil {
 			recvErr := fmt.Errorf("Send echo error: %s", err)
 			ch <- recvResult{nil, recvErr}
@@ -140,24 +139,15 @@ func (p *PingProc) recvEchoReply(cn *icmp.PacketConn, ch chan recvResult) {
 
 		switch msg.Type {
 		case ipv4.ICMPTypeEchoReply:
-			log.Printf("got reflection from %v", peer)
-			ch <- recvResult{bytes, nil}
+			ch <- recvResult{msg, nil}
 		default:
-			log.Printf("got %+v; want echo reply", msg)
 			recvErr := fmt.Errorf("Send echo error: not echo reply message type")
 			ch <- recvResult{nil, recvErr}
 		}
 	}
 }
 
-func (p *PingProc) handleRecv(bytes []byte) {
-	var msg *icmp.Message
-	var err error
-	if msg, err = icmp.ParseMessage(protoNum, bytes); err != nil {
-		fmt.Printf("Handle receive error: %s", err)
-		return
-	}
-
+func (p *PingProc) handleRecv(msg *icmp.Message) {
 	var rtt time.Duration
 	switch body := msg.Body.(type) {
 	case *icmp.Echo:
@@ -183,7 +173,11 @@ func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
 			p.seqnum++
 			fmt.Printf("unreachable: %s.\n", p.dst.IP.String())
 		case res := <-ping:
-			p.handleRecv(res.bytes)
+			if res.err == nil {
+				p.handleRecv(res.msg)
+			} else {
+				fmt.Printf("Error during message receiving: %s.\n", res.err)
+			}
 			timer.Stop()
 			time.Sleep(p.interval)
 		}
