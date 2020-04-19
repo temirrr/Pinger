@@ -15,7 +15,8 @@ import (
 )
 
 func parseArgs(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
-	flag.BoolVar(isIPv6Ptr, "ipv6", false, "Set this flag if you want to use IPv6")
+	flag.BoolVar(isIPv6Ptr, "6", false, "Set this flag if you want to use IPv6")
+	flag.IntVar(ttlPtr, "t", 100, "Specifies TTL (Time to live).")
 	flag.IntVar(ttlPtr, "ttl", 100, "Specifies TTL (Time to live).")
 	Usage := func() {
 		fmt.Fprintf(os.Stderr, "Usage : %s:\n", os.Args[0])
@@ -171,10 +172,10 @@ func (p *PingProc) handleRecv(msg *icmp.Message) {
 	}
 
 	fmt.Printf(
-		"64 bytes from %s: icmp_seq=%d time=%v\n",
+		"64 bytes from %s: icmp_seq=%d time=%dms\n",
 		p.dst.IP.String(),
 		p.seqnum,
-		rtt,
+		rtt.Milliseconds(),
 	)
 }
 
