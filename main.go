@@ -6,37 +6,39 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-const (
-	protoNum = 1 // ipv4.ICMPTypeEchoReply.Protocol()
-)
-
-func parseArgs(hostPtr *string, ipVersionPtr *string, ttlPtr *int) {
-	ipVersionFlag := flag.String("ip", "ipv4", "IP version: {ipv4|ipv6}.")
-	ttlFlag := flag.Int("ttl", 100, "Specifies TTL (Time to live).")
+func parseArgs(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
+	flag.BoolVar(isIPv6Ptr, "ipv6", false, "Set this flag if you want to use IPv6")
+	flag.IntVar(ttlPtr, "ttl", 100, "Specifies TTL (Time to live).")
 	Usage := func() {
 		fmt.Fprintf(os.Stderr, "Usage : %s:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	*ipVersionPtr = *ipVersionFlag
-	*ttlPtr = *ttlFlag
 	*hostPtr = flag.Arg(0)
 	if flag.NArg() == 0 {
 		Usage()
 		os.Exit(1)
 	}
+}
 
+func printSetup(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
+	ipVersionStr := "IPv4"
+	if *isIPv6Ptr {
+		ipVersionStr = "IPv6"
+	}
 	fmt.Printf(
 		"Hostname or IP address: %s, IP version: %s, ttl: %d.\n",
 		*hostPtr,
-		*ipVersionPtr,
+		ipVersionStr,
 		*ttlPtr,
 	)
 }
@@ -74,25 +76,32 @@ type PingProc struct {
 	id       int
 	seqnum   int
 	dst      net.IPAddr
+	isIPv6   bool
 	rttLimit time.Duration
 	interval time.Duration // time between echo signals
 }
 
-func newPingProc(dstIP net.IPAddr) *PingProc {
+func newPingProc(dstIP net.IPAddr, isIPv6 bool) *PingProc {
 	// ensuring new seed value everytime
 	rand.Seed(time.Now().UnixNano())
+
 	return &PingProc{
-		id:     rand.Intn(1 << 16), // mock random id
-		seqnum: rand.Intn(1 << 16),
-		// (TODO): add zone for IPv6
+		id:       rand.Intn(1 << 16),
+		seqnum:   rand.Intn(1 << 16),
 		dst:      dstIP,
-		rttLimit: 2000 * time.Millisecond,
-		interval: 1300 * time.Millisecond,
+		isIPv6:   isIPv6,
+		rttLimit: 2 * time.Second,
+		interval: time.Second,
 	}
 }
 
 func (p *PingProc) sendEcho(cn *icmp.PacketConn) error {
-	msgType := ipv4.ICMPTypeEcho
+	var msgType icmp.Type
+	if !p.isIPv6 {
+		msgType = ipv4.ICMPTypeEcho
+	} else {
+		msgType = ipv6.ICMPTypeEchoRequest
+	}
 	t := timeToBytes(time.Now())
 
 	// checksum is calculated by `Marshal` method
@@ -131,6 +140,7 @@ func (p *PingProc) recvEchoReply(cn *icmp.PacketConn, ch chan recvResult) {
 		}
 
 		var msg *icmp.Message
+		protoNum := ipv4.ICMPTypeEchoReply.Protocol()
 		if msg, err = icmp.ParseMessage(protoNum, bytes); err != nil {
 			recvErr := fmt.Errorf("Send echo error: %s", err)
 			ch <- recvResult{nil, recvErr}
@@ -139,6 +149,8 @@ func (p *PingProc) recvEchoReply(cn *icmp.PacketConn, ch chan recvResult) {
 
 		switch msg.Type {
 		case ipv4.ICMPTypeEchoReply:
+			fallthrough
+		case ipv6.ICMPTypeEchoReply:
 			ch <- recvResult{msg, nil}
 		default:
 			recvErr := fmt.Errorf("Send echo error: not echo reply message type")
@@ -158,7 +170,12 @@ func (p *PingProc) handleRecv(msg *icmp.Message) {
 		return // silently return
 	}
 
-	fmt.Printf("64 bytes from %s: time=%v\n", p.dst.IP.String(), rtt)
+	fmt.Printf(
+		"64 bytes from %s: icmp_seq=%d time=%v\n",
+		p.dst.IP.String(),
+		p.seqnum,
+		rtt,
+	)
 }
 
 func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
@@ -170,7 +187,6 @@ func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
 	for {
 		select {
 		case <-timer.C:
-			p.seqnum++
 			fmt.Printf("unreachable: %s.\n", p.dst.IP.String())
 		case res := <-ping:
 			if res.err == nil {
@@ -183,7 +199,9 @@ func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
 		}
 
 		timer.Reset(p.rttLimit)
+		p.seqnum++
 		if err := p.sendEcho(cn); err != nil {
+			fmt.Printf("Send error: %s.\n", err)
 			break
 		}
 	}
@@ -193,11 +211,22 @@ func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
 }
 
 func main() {
-	var host, ipVersion string
+	var host string
+	var isIPv6 bool
 	var ttl int
-	network := "ip4:icmp"
 
-	parseArgs(&host, &ipVersion, &ttl)
+	parseArgs(&host, &isIPv6, &ttl)
+
+	if strings.Index(host, ":") != -1 {
+		isIPv6 = true
+	}
+
+	printSetup(&host, &isIPv6, &ttl)
+
+	network := "ip4:icmp"
+	if isIPv6 {
+		network = "ip6:ipv6-icmp"
+	}
 
 	res, err := net.ResolveIPAddr(network, host)
 	if err != nil {
@@ -205,7 +234,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := newPingProc(net.IPAddr{IP: res.IP, Zone: res.Zone})
+	p := newPingProc(net.IPAddr{IP: res.IP, Zone: res.Zone}, isIPv6)
+
 	cn := getConnection(network, "")
 
 	if err := pingLoop(p, cn); err != nil {
