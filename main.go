@@ -37,7 +37,7 @@ func printSetup(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
 		ipVersionStr = "IPv6"
 	}
 	fmt.Printf(
-		"Hostname or IP address: %s, IP version: %s, ttl: %d.\n",
+		"PING %s, IP version: %s, ttl: %d.\n",
 		*hostPtr,
 		ipVersionStr,
 		*ttlPtr,
@@ -63,26 +63,18 @@ func bytesToTime(bytes []byte) time.Time {
 	return time.Unix(nsecs/1000000000, nsecs%1000000000)
 }
 
-func getConnection(network, address string) *icmp.PacketConn {
-	conn, err := icmp.ListenPacket(network, address)
-	if err != nil {
-		fmt.Printf("Opening connection error: %s.\n", err)
-		os.Exit(1)
-	}
-	return conn
-}
-
 // PingProc is a client's ping process.
 type PingProc struct {
 	id       int
 	seqnum   int
 	dst      net.IPAddr
 	isIPv6   bool
+	ttl      int
 	rttLimit time.Duration
 	interval time.Duration // time between echo signals
 }
 
-func newPingProc(dstIP net.IPAddr, isIPv6 bool) *PingProc {
+func newPingProc(dstIP net.IPAddr, isIPv6 bool, ttl int) *PingProc {
 	// ensuring new seed value everytime
 	rand.Seed(time.Now().UnixNano())
 
@@ -91,9 +83,28 @@ func newPingProc(dstIP net.IPAddr, isIPv6 bool) *PingProc {
 		seqnum:   rand.Intn(1 << 16),
 		dst:      dstIP,
 		isIPv6:   isIPv6,
+		ttl:      ttl,
 		rttLimit: 2 * time.Second,
 		interval: time.Second,
 	}
+}
+
+func (p *PingProc) getConnection(network, address string) *icmp.PacketConn {
+	conn, err := icmp.ListenPacket(network, address)
+	if err != nil {
+		fmt.Printf("Opening connection error: %s.\n", err)
+		os.Exit(1)
+	}
+
+	if !p.isIPv6 {
+		conn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true)
+		conn.IPv4PacketConn().SetTTL(p.ttl)
+	} else {
+		conn.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit, true)
+		conn.IPv6PacketConn().SetHopLimit(p.ttl)
+	}
+
+	return conn
 }
 
 func (p *PingProc) sendEcho(cn *icmp.PacketConn) error {
@@ -103,6 +114,7 @@ func (p *PingProc) sendEcho(cn *icmp.PacketConn) error {
 	} else {
 		msgType = ipv6.ICMPTypeEchoRequest
 	}
+	p.seqnum++
 	t := timeToBytes(time.Now())
 
 	// checksum is calculated by `Marshal` method
@@ -126,6 +138,7 @@ func (p *PingProc) sendEcho(cn *icmp.PacketConn) error {
 
 type recvResult struct {
 	msg *icmp.Message
+	ttl int
 	err error
 }
 
@@ -133,50 +146,87 @@ func (p *PingProc) recvEchoReply(cn *icmp.PacketConn, ch chan recvResult) {
 	for {
 		bytes := make([]byte, 512)
 
-		_, _, err := cn.ReadFrom(bytes)
-		if err != nil {
-			recvErr := fmt.Errorf("Send echo error: %s", err)
-			ch <- recvResult{nil, recvErr}
-			return
+		var ttl int
+		var err error
+		if !p.isIPv6 {
+			var cm *ipv4.ControlMessage
+			_, cm, _, err = cn.IPv4PacketConn().ReadFrom(bytes)
+			if err != nil {
+				recvErr := fmt.Errorf("Send echo error: %s", err)
+				ch <- recvResult{nil, -1, recvErr}
+				return
+			}
+			if cm != nil {
+				ttl = cm.TTL
+			}
+		} else {
+			var cm *ipv6.ControlMessage
+			_, cm, _, err = cn.IPv6PacketConn().ReadFrom(bytes)
+			if err != nil {
+				recvErr := fmt.Errorf("Send echo error: %s", err)
+				ch <- recvResult{nil, -1, recvErr}
+				return
+			}
+			if cm != nil {
+				ttl = cm.HopLimit
+			}
 		}
 
 		var msg *icmp.Message
 		protoNum := ipv4.ICMPTypeEchoReply.Protocol()
+		if p.isIPv6 {
+			protoNum = ipv6.ICMPTypeEchoReply.Protocol()
+		}
 		if msg, err = icmp.ParseMessage(protoNum, bytes); err != nil {
 			recvErr := fmt.Errorf("Send echo error: %s", err)
-			ch <- recvResult{nil, recvErr}
+			ch <- recvResult{nil, -1, recvErr}
 			return
 		}
 
-		switch msg.Type {
-		case ipv4.ICMPTypeEchoReply:
-			fallthrough
-		case ipv6.ICMPTypeEchoReply:
-			ch <- recvResult{msg, nil}
-		default:
-			recvErr := fmt.Errorf("Send echo error: not echo reply message type")
-			ch <- recvResult{nil, recvErr}
-		}
+		ch <- recvResult{msg, ttl, nil}
 	}
 }
 
-func (p *PingProc) handleRecv(msg *icmp.Message) {
+func (p *PingProc) handleEchoReply(msg *icmp.Message, ttl int) {
 	var rtt time.Duration
 	switch body := msg.Body.(type) {
 	case *icmp.Echo:
 		if body.ID == p.id && body.Seq == p.seqnum {
 			rtt = time.Since(bytesToTime(body.Data))
 		}
-	default:
-		return // silently return
 	}
 
 	fmt.Printf(
-		"64 bytes from %s: icmp_seq=%d time=%dms\n",
+		"64 bytes from %s: icmp_seq=%d ttl=%d time=%dms\n",
 		p.dst.IP.String(),
 		p.seqnum,
+		ttl, // incoming `ttl` is different from outgoing `p.ttl`
 		rtt.Milliseconds(),
 	)
+}
+
+func (p *PingProc) handleTimeExceeded() {
+	fmt.Printf(
+		"From %s: icmp_seq=%d Time exceeded: Hop limit\n",
+		p.dst.IP.String(),
+		p.seqnum,
+	)
+}
+
+// handleMsg is a general received message handler.
+func (p *PingProc) handleMsg(msg *icmp.Message, ttl int) {
+	switch msg.Type {
+	case ipv4.ICMPTypeEchoReply:
+		fallthrough
+	case ipv6.ICMPTypeEchoReply:
+		p.handleEchoReply(msg, ttl)
+	case ipv4.ICMPTypeTimeExceeded:
+		fallthrough
+	case ipv6.ICMPTypeTimeExceeded:
+		p.handleTimeExceeded()
+	default:
+		fmt.Printf("Unexpected message type received.")
+	}
 }
 
 func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
@@ -191,7 +241,7 @@ func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
 			fmt.Printf("unreachable: %s.\n", p.dst.IP.String())
 		case res := <-ping:
 			if res.err == nil {
-				p.handleRecv(res.msg)
+				p.handleMsg(res.msg, res.ttl)
 			} else {
 				fmt.Printf("Error during message receiving: %s.\n", res.err)
 			}
@@ -200,7 +250,6 @@ func pingLoop(p *PingProc, cn *icmp.PacketConn) error {
 		}
 
 		timer.Reset(p.rttLimit)
-		p.seqnum++
 		if err := p.sendEcho(cn); err != nil {
 			fmt.Printf("Send error: %s.\n", err)
 			break
@@ -235,9 +284,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := newPingProc(net.IPAddr{IP: res.IP, Zone: res.Zone}, isIPv6)
-
-	cn := getConnection(network, "")
+	p := newPingProc(net.IPAddr{IP: res.IP, Zone: res.Zone}, isIPv6, ttl)
+	cn := p.getConnection(network, "")
 
 	if err := pingLoop(p, cn); err != nil {
 		fmt.Println(err)
