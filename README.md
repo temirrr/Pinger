@@ -20,3 +20,7 @@ This is a pinger application, which can ping IPv4 addresses and has limited supp
 - -6 Set the IP version to IPv6.
 NOTE: You do not need to set this option, if you provide literal IPv6 address.
 NOTE: As I only have Link-Local IPv6 address, I had hard times getting a public one. So even though I implemented IPv6 functionality, I couldn't test it. Thus, it may not work.
+
+## Technical details
+- This app uses privileged sockets for simplicity, thus the use of `sudo` is needed.
+- The pinger is based on *stop-and-wait* principle. This means, we send the ICMP echo request and then wait for echo reply before sending another message. This approach helps to simply reason about the behaviour and adds possibility of representing the pinger as the state machine.
