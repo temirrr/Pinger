@@ -31,7 +31,7 @@ func parseArgs(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
 	}
 }
 
-func printSetup(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
+func printArgs(hostPtr *string, isIPv6Ptr *bool, ttlPtr *int) {
 	ipVersionStr := "IPv4"
 	if *isIPv6Ptr {
 		ipVersionStr = "IPv6"
@@ -271,7 +271,7 @@ func main() {
 		isIPv6 = true
 	}
 
-	printSetup(&host, &isIPv6, &ttl)
+	printArgs(&host, &isIPv6, &ttl)
 
 	network := "ip4:icmp"
 	if isIPv6 {
